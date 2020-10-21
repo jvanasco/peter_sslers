@@ -53,7 +53,8 @@ export SSL_CONF_REDIS_SERVER=/path/to
 
 NOTE: SSL_TEST_DOMAINS can be a comma-separated string
 
-if running letsencrypt tests, you need to specify a domain and make sure to proxy to this app so letsencrypt can access it
+If running LetsEncrypt tests: you must specify a domain, and make sure to proxy
+port80 of that domain to this app, so LetsEncrypt can access it.
 
 see the nginx test config file `testing.conf`
 
@@ -63,10 +64,13 @@ see the nginx test config file `testing.conf`
 RUN_NGINX_TESTS = bool(int(os.environ.get("SSL_RUN_NGINX_TESTS", 0)))
 # run tests to prime redis
 RUN_REDIS_TESTS = bool(int(os.environ.get("SSL_RUN_REDIS_TESTS", 0)))
+
 # run tests against LE API
 RUN_API_TESTS__PEBBLE = bool(int(os.environ.get("SSL_RUN_API_TESTS__PEBBLE", 0)))
 # does the LE validation work?  LE must be able to reach this
-LETSENCRYPT_API_VALIDATES = bool(int(os.environ.get("SSL_PEBBLE_API_VALIDATES", 0)))
+LETSENCRYPT_API_VALIDATES = bool(
+    int(os.environ.get("SSL_LETSENCRYPT_API_VALIDATES", 0))
+)
 
 SSL_TEST_DOMAINS = os.environ.get("SSL_TEST_DOMAINS", "example.com")
 SSL_TEST_PORT = int(os.environ.get("SSL_TEST_PORT", 7201))
@@ -74,19 +78,34 @@ SSL_TEST_PORT = int(os.environ.get("SSL_TEST_PORT", 7201))
 # coordinate the port with `test.ini`
 SSL_BIN_REDIS_SERVER = os.environ.get("SSL_BIN_REDIS_SERVER", None) or "redis-server"
 SSL_CONF_REDIS_SERVER = os.environ.get("SSL_CONF_REDIS_SERVER", None) or None
-if SSL_CONF_REDIS_SERVER is None:
+if not SSL_CONF_REDIS_SERVER:
     SSL_CONF_REDIS_SERVER = "/".join(
         __file__.split("/")[:-1]
         + [
+            "test_data",
             "redis-server.conf",
         ]
     )
 
+if not os.path.exists(SSL_CONF_REDIS_SERVER):
+    raise ValueError(
+        "SSL_CONF_REDIS_SERVER (%s) does not exist" % SSL_CONF_REDIS_SERVER
+    )
+
+
+GOPATH = os.environ.get("GOPATH")
+
 PEBBLE_CONFIG = (
-    "%s/src/github.com/letsencrypt/pebble/test/config/pebble-config.json"
-    % os.environ.get("GOPATH")
+    "%s/src/github.com/letsencrypt/pebble/test/config/pebble-config.json" % GOPATH
 )
-PEBBLE_DIR = "%s/src/github.com/letsencrypt/pebble" % os.environ.get("GOPATH")
+PEBBLE_DIR = "%s/src/github.com/letsencrypt/pebble" % GOPATH
+
+if RUN_API_TESTS__PEBBLE:
+    if not GOPATH:
+        raise ValueError("GOPATH not defined in environment")
+    if not os.path.exists(PEBBLE_DIR):
+        raise ValueError("PEBBLE_DIR (%s) does not exist" % PEBBLE_DIR)
+
 PEBBLE_ENV = os.environ.copy()
 PEBBLE_ENV["PEBBLE_VA_ALWAYS_VALID"] = "1"
 PEBBLE_ENV["PEBBLE_AUTHZREUSE"] = "100"
@@ -126,7 +145,8 @@ def under_pebble(_function):
 
     @wraps(_function)
     def _wrapper(*args, **kwargs):
-        log.info("++ spinning up `pebble`")
+        log.info("`pebble`: spinning up")
+        log.info("`pebble`: PEBBLE_CONFIG : %s", PEBBLE_CONFIG)
         res = None  # scoping
         with psutil.Popen(
             ["pebble", "-config", PEBBLE_CONFIG],
@@ -140,21 +160,22 @@ def under_pebble(_function):
             ready = False
             _waits = 0
             while not ready:
-                log.info("waiting for `pebble` to be ready")
+                log.info("`pebble`: waiting for ready")
                 for line in iter(proc.stdout.readline, b""):
                     if b"Listening on: 0.0.0.0:14000" in line:
+                        log.info("`pebble`: ready")
                         ready = True
                         break
                 _waits += 1
                 if _waits >= 5:
-                    raise ValueError("error spinning up pebble")
+                    raise ValueError("`pebble`: ERROR spinning up")
                 time.sleep(1)
             try:
                 res = _function(*args, **kwargs)
             finally:
                 # explicitly terminate, otherwise it won't exit
                 # in a `finally` to ensure we terminate on exceptions
-                log.info("xx terminating `pebble`")
+                log.info("`pebble`: finished. terminating")
                 proc.terminate()
         return res
 
@@ -168,7 +189,8 @@ def under_pebble_strict(_function):
 
     @wraps(_function)
     def _wrapper(*args, **kwargs):
-        log.info("++ spinning up `pebble`")
+        log.info("`pebble[strict]`: spinning up")
+        log.info("`pebble[strict]`: PEBBLE_CONFIG : %s", PEBBLE_CONFIG)
         res = None  # scoping
         with psutil.Popen(
             ["pebble", "-config", PEBBLE_CONFIG],
@@ -182,21 +204,22 @@ def under_pebble_strict(_function):
             ready = False
             _waits = 0
             while not ready:
-                log.info("waiting for `pebble` to be ready")
+                log.info("`pebble[strict]`: waiting for ready")
                 for line in iter(proc.stdout.readline, b""):
                     if b"Listening on: 0.0.0.0:14000" in line:
+                        log.info("`pebble[strict]`: ready")
                         ready = True
                         break
                 _waits += 1
                 if _waits >= 5:
-                    raise ValueError("error spinning up pebble")
+                    raise ValueError("`pebble[strict]`: ERROR spinning up")
                 time.sleep(1)
             try:
                 res = _function(*args, **kwargs)
             finally:
                 # explicitly terminate, otherwise it won't exit
                 # in a `finally` to ensure we terminate on exceptions
-                log.info("xx terminating `pebble`")
+                log.info("`pebble[strict]`: finished. terminating")
                 proc.terminate()
         return res
 
@@ -210,36 +233,44 @@ def under_redis(_function):
 
     @wraps(_function)
     def _wrapper(*args, **kwargs):
-        log.info("++ spinning up `pebble`")
+        log.info("`redis`: spinning up")
+        log.info("`redis`: SSL_BIN_REDIS_SERVER  : %s", SSL_BIN_REDIS_SERVER)
+        log.info("`redis`: SSL_CONF_REDIS_SERVER : %s", SSL_CONF_REDIS_SERVER)
         res = None  # scoping
-        # /usr/local/Cellar/redis/3.0.7/bin/redis-server /Users/jvanasco/webserver/sites/CliquedInDeploy/trunk/config/environments/development/redis/redis-server--6379.conf
         with psutil.Popen(
             [SSL_BIN_REDIS_SERVER, SSL_CONF_REDIS_SERVER],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         ) as proc:
-            # ensure the `pebble` server is running
+            # ensure the `redis` server is running
             ready = False
             _waits = 0
             while not ready:
-                log.info("waiting for `redis` to be ready")
+                log.info("`redis`: waiting for ready")
                 for line in iter(proc.stdout.readline, b""):
                     if b"Can't chdir to" in line:
                         raise ValueError(line)
-                    if b"The server is now ready to accept connections on port" in line:
+                    # Redis 5.x
+                    if b"Ready to accept connections" in line:
+                        log.info("`redis`: ready")
+                        ready = True
+                        break
+                    # Redis2.x
+                    if b"The server is now ready to accept connections" in line:
+                        log.info("`redis`: ready")
                         ready = True
                         break
                 _waits += 1
                 if _waits >= 5:
-                    raise ValueError("error spinning up redis")
+                    raise ValueError("`redis`: ERROR spinning up")
                 time.sleep(1)
             try:
                 res = _function(*args, **kwargs)
             finally:
                 # explicitly terminate, otherwise it won't exit
                 # in a `finally` to ensure we terminate on exceptions
-                log.info("xx terminating `redis`")
+                log.info("`redis`: finished. terminating")
                 proc.terminate()
         return res
 
@@ -1037,7 +1068,10 @@ class AppTest(AppTestCore):
                 # queue a domain
                 # this MUST be a new domain to add to the queue
                 # if it is existing, a domain will not be added
-                db.queues.queue_domains__add(self.ctx, ["queue.example.com"])
+                db.queues.queue_domains__add(
+                    self.ctx,
+                    ["queue.example.com", "queue2.example.com", "queue3.example.com"],
+                )
                 # self.ctx.pyramid_transaction_commit()
 
                 # note: pre-populate QueueCertificate
